@@ -173,6 +173,7 @@ def build_eagle3_dataset(
 
     dataset = dataset.shuffle(seed=shuffle_seed)
     original_cols = dataset.column_names
+    original_cols.remove("id")
 
     def preprocess_function(examples):
         # Always do preprocessing
