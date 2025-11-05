@@ -1,5 +1,5 @@
 import json
-import netrc
+import logging
 import os
 import re
 from contextlib import contextmanager
@@ -7,40 +7,9 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
-from transformers import PretrainedConfig
+from transformers import AutoConfig, PretrainedConfig
 
-
-def validate_wandb_args(parser, args):
-    if not args.wandb:
-        return
-    if args.wandb_key is not None:
-        return
-
-    if "WANDB_API_KEY" in os.environ:
-        args.wandb_key = os.environ["WANDB_API_KEY"]
-        return
-
-    # Check ~/.netrc file for wandb credentials
-    try:
-        netrc_path = os.path.expanduser("~/.netrc")
-        if os.path.exists(netrc_path):
-            netrc_file = netrc.netrc(netrc_path)
-            # Check for api.wandb.ai machine
-            if "api.wandb.ai" in netrc_file.hosts:
-                login, account, password = netrc_file.authenticators("api.wandb.ai")
-                if password:
-                    args.wandb_key = password
-                    return True
-    except (FileNotFoundError, netrc.NetrcParseError):
-        pass
-
-    if args.wandb_key is None:
-        parser.error(
-            "When --wandb is enabled, you must provide a wandb API key via one of:\n"
-            "  1. --wandb-key argument\n"
-            "  2. WANDB_API_KEY environment variable\n"
-            "  3. wandb login api-key"
-        )
+logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -81,15 +50,20 @@ def load_config_from_file(config_path: str):
 
 
 def print_with_rank(message):
-    print(f"rank {dist.get_rank()}: {message}")
+    if dist.is_available() and dist.is_initialized():
+        logger.info(f"rank {dist.get_rank()}: {message}")
+    else:
+        logger.info(f"non-distributed: {message}")
 
 
-PREFIX_CHECKPOINT_DIR = "epoch"
-_re_checkpoint = re.compile(r"^" + PREFIX_CHECKPOINT_DIR + r"_(\d+)$")
+def print_on_rank0(message):
+    if dist.get_rank() == 0:
+        logger.info(message)
 
 
-def get_last_checkpoint(folder):
+def get_last_checkpoint(folder, prefix="epoch"):
     content = os.listdir(folder)
+    _re_checkpoint = re.compile(r"^" + prefix + r"_(\d+)$")
     checkpoints = [
         path
         for path in content
@@ -102,3 +76,175 @@ def get_last_checkpoint(folder):
         folder,
         max(checkpoints, key=lambda x: int(_re_checkpoint.search(x).groups()[0])),
     )
+
+
+def generate_draft_model_config(
+    target_model_path: str, template_config_path: str = None, cache_dir: str = None
+):
+    """
+    Auto-generate draft model config based on target model parameters aligned with template config
+
+    Args:
+        target_model_path (str): Path to the target model
+        template_config_path (str, optional): Template config file path, defaults to llama3-8B-eagle3.json
+        cache_dir (str, optional): Cache directory
+
+    Returns:
+        dict: Generated draft model config dictionary
+    """
+    # Get target model config
+    target_config = AutoConfig.from_pretrained(target_model_path, cache_dir=cache_dir)
+
+    # If no template specified, use default llama3-8B-eagle3.json
+    if template_config_path is None:
+        # Use the script execution directory as base
+        import sys
+
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        project_root = os.path.dirname(script_dir)  # Go up one level from scripts/
+        template_config_path = os.path.join(
+            project_root, "configs", "llama3-8B-eagle3.json"
+        )
+
+    # Read template config
+    with open(template_config_path, "r") as f:
+        draft_config = json.load(f)
+
+    # Adjust architecture config based on target model type
+    if hasattr(target_config, "model_type"):
+        # Default to llama architecture
+        draft_config["model_type"] = "llama"
+
+    # Align key parameters
+    param_mappings = {
+        "vocab_size": "vocab_size",
+        "hidden_size": "hidden_size",
+        "num_attention_heads": "num_attention_heads",
+        "num_key_value_heads": "num_key_value_heads",
+        "intermediate_size": "intermediate_size",
+        "max_position_embeddings": "max_position_embeddings",
+        "rms_norm_eps": "rms_norm_eps",
+        "hidden_act": "hidden_act",
+        "bos_token_id": "bos_token_id",
+        "eos_token_id": "eos_token_id",
+        "torch_dtype": "torch_dtype",
+    }
+
+    # Copy parameters from target model to draft config
+    for target_param, draft_param in param_mappings.items():
+        if hasattr(target_config, target_param):
+            value = getattr(target_config, target_param)
+            # Special handling for torch_dtype to make it JSON serializable
+            if target_param == "torch_dtype" and isinstance(value, torch.dtype):
+                value = str(value).replace("torch.", "")
+            draft_config[draft_param] = value
+
+    # Special handling for some parameters
+    # Ensure num_hidden_layers is always 1 (EAGLE3 feature)
+    draft_config["num_hidden_layers"] = 1
+
+    # Keep some fixed draft model specific parameters
+    draft_config["tie_word_embeddings"] = False
+    draft_config["use_cache"] = True
+
+    # If template doesn't have draft_vocab_size, set default
+    if "draft_vocab_size" not in draft_config:
+        draft_config["draft_vocab_size"] = 32000  # Default value
+
+    return draft_config
+
+
+def save_draft_model_config(config_dict: dict, output_path: str):
+    """
+    Save draft model config to file
+
+    Args:
+        config_dict (dict): Config dictionary
+        output_path (str): Output file path
+    """
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(config_dict, f, indent=2, ensure_ascii=False)
+
+    print(f"Draft model config saved to: {output_path}")
+
+
+def create_draft_config_from_target(
+    target_model_path: str,
+    output_dir: str = None,
+    template_config_path: str = None,
+    cache_dir: str = None,
+):
+    """
+    Convenient function to create draft model config file from target model
+
+    Args:
+        target_model_path (str): Target model path
+        output_dir (str, optional): Output directory, defaults to configs folder in current directory
+        template_config_path (str, optional): Template config path
+        cache_dir (str, optional): Cache directory
+
+    Returns:
+        str: Generated config file path
+    """
+    # Generate config
+    rank = dist.get_rank()
+
+    if rank == 0:
+        print_with_rank(
+            "No draft model config provided, auto-generating from target model..."
+        )
+        config_dict = generate_draft_model_config(
+            target_model_path, template_config_path, cache_dir
+        )
+    dist.barrier()
+
+    # Determine output path
+    if output_dir is None:
+        # Use the script execution directory as base
+        import sys
+
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        project_root = os.path.dirname(script_dir)  # Go up one level from scripts/
+        output_dir = os.path.join(project_root, "configs")
+
+    # Extract model name from model path
+    model_name = target_model_path.split("/")[-1].lower()
+    output_filename = f"{model_name}-eagle3-auto.json"
+    output_path = os.path.join(output_dir, output_filename)
+
+    # Save config
+    if rank == 0:
+        save_draft_model_config(config_dict, output_path)
+        print_with_rank(f"Auto-generated draft model config saved to: {output_path}")
+    dist.barrier()
+
+    return output_path
+
+
+def get_full_optimizer_state(optimizer_state_dict: dict):
+    """
+    Convert optimizer state dict with DTensor to full tensors for saving
+
+    Args:
+        optimizer_state_dict (dict): Optimizer state dict possibly containing DTensors
+    Returns:
+        dict: Optimizer state dict with full tensors
+    """
+    full_optimizer_state_dict = {
+        k: v for k, v in optimizer_state_dict.items() if k != "state"
+    }
+    if "state" in optimizer_state_dict:
+        full_optimizer_state_dict["state"] = {
+            param_id: {
+                state_key: (
+                    state_tensor.full_tensor()
+                    if isinstance(state_tensor, torch.distributed.tensor.DTensor)
+                    else state_tensor
+                )
+                for state_key, state_tensor in param_state.items()
+            }
+            for param_id, param_state in optimizer_state_dict["state"].items()
+        }
+    return full_optimizer_state_dict

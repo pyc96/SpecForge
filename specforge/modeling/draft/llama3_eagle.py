@@ -1,18 +1,23 @@
-import logging
 import math
 from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers import GenerationMixin, LlamaConfig, PreTrainedModel
 from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-from ..utils import padding
-from .base import Eagle3DraftModel
+from specforge.modeling.draft.flex_attention import (
+    compile_friendly_create_block_mask,
+    compile_friendly_flex_attention,
+    generate_eagle3_mask,
+)
+from specforge.utils import print_with_rank
 
-logger = logging.getLogger(__name__)
+from .base import Eagle3DraftModel
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -84,6 +89,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
+@torch.compile(dynamic=True)
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
     cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
@@ -93,6 +99,79 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors (https://qwenlm.github.io/blog/qwen2-vl/).
+
+    Explanation:
+        Multimodal 3D rotary position embedding is an extension to 1D rotary position embedding. The input embedding
+        sequence contains vision (images / videos) embedding and text embedding or just contains text embedding. For
+        vision embedding part, we apply rotary position embedding on temporal, height and width dimension separately.
+        Here we split the channel dimension to 3 chunks for the temporal, height and width rotary position embedding.
+        For text embedding part, we just apply 1D rotary position embedding. The three rotary position index (temporal,
+        height and width) of text embedding is always the same, so the text embedding rotary position embedding has no
+        difference with modern LLMs.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`):
+            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
+            used to pass offsetted position ids when working with a KV-cache.
+        mrope_section(`List(int)`):
+            Multimodal rope section is for channel dimension of temporal, height and width in rope calculation.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    mrope_section = mrope_section * 2
+    cos = torch.cat(
+        [m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1
+    ).unsqueeze(unsqueeze_dim)
+    sin = torch.cat(
+        [m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1
+    ).unsqueeze(unsqueeze_dim)
+
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def prepare_decoder_attention_mask(
+    attention_mask, input_shape, inputs_embeds, past_key_values_length
+):
+    # create causal mask
+    # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+    combined_attention_mask = None
+    if input_shape[-1] > 1:
+        combined_attention_mask = _make_causal_mask(
+            input_shape,
+            inputs_embeds.dtype,
+            device=inputs_embeds.device,
+            past_key_values_length=past_key_values_length,
+        )
+
+    if attention_mask is not None:
+        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+        expanded_attn_mask = _expand_mask(
+            attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
+        ).to(inputs_embeds.device)
+        combined_attention_mask = (
+            expanded_attn_mask
+            if combined_attention_mask is None
+            else expanded_attn_mask + combined_attention_mask
+        )
+
+    return combined_attention_mask
 
 
 class LlamaRotaryEmbedding(torch.nn.Module):
@@ -130,6 +209,7 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             "sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False
         )
 
+    @torch.compile(dynamic=True)
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
         if seq_len > self.max_seq_len_cached:
@@ -215,6 +295,156 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
         )
 
 
+class LlamaMutiRotaryEmbedding(LlamaRotaryEmbedding):
+    def __init__(
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        device=None,
+        scaling_factor=1.0,
+    ):
+        super().__init__(dim, max_position_embeddings, base, device)
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x, position_ids):
+        # In contrast to other models, Qwen2_5_VL has different position ids for the grids
+        # So we expand the inv_freq to shape (3, ...)
+        inv_freq_expanded = (
+            self.inv_freq[None, None, :, None]
+            .float()
+            .expand(3, position_ids.shape[1], -1, 1)
+        )
+        position_ids_expanded = position_ids[
+            :, :, None, :
+        ].float()  # shape (3, bs, 1, positions)
+
+        device_type = (
+            x.device.type
+            if isinstance(x.device.type, str) and x.device.type != "mps"
+            else "cpu"
+        )
+        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).transpose(2, 3)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.scaling_factor
+            sin = emb.sin() * self.scaling_factor
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+# Inverse dim formula to find dim based on number of rotations
+def yarn_find_correction_dim(
+    num_rotations, dim, base=10000, max_position_embeddings=2048
+):
+    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
+        2 * math.log(base)
+    )
+
+
+# Find dim range bounds based on rotations
+def yarn_find_correction_range(
+    low_rot, high_rot, dim, base=10000, max_position_embeddings=2048
+):
+    low = math.floor(
+        yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
+    )
+    high = math.ceil(
+        yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
+    )
+    return max(low, 0), min(high, dim - 1)  # Clamp values just in case
+
+
+def yarn_get_mscale(scale=1, mscale=1):
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
+def yarn_linear_ramp_mask(min_val, max_val, dim):
+    if min_val == max_val:
+        max_val += 0.001  # Prevent singularity
+    linear_func = (torch.arange(dim, dtype=torch.float32) - min_val) / (
+        max_val - min_val
+    )
+    ramp_func = torch.clamp(linear_func, 0, 1)
+    return ramp_func
+
+
+class LlamaYarnRotaryEmbedding(LlamaRotaryEmbedding):
+
+    def __init__(
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        device=None,
+        scaling_factor=1.0,
+        original_max_position_embeddings=4096,
+        beta_fast=32,
+        beta_slow=1,
+        mscale=1,
+        mscale_all_dim=0,
+    ):
+        self.scaling_factor = scaling_factor
+        self.original_max_position_embeddings = original_max_position_embeddings
+        self.beta_fast = beta_fast
+        self.beta_slow = beta_slow
+        self.mscale = mscale
+        self.mscale_all_dim = mscale_all_dim
+        super().__init__(dim, max_position_embeddings, base, device)
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        dim = self.dim
+
+        freq_extra = 1.0 / (
+            self.base
+            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+        )
+        freq_inter = 1.0 / (
+            self.scaling_factor
+            * self.base
+            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+        )
+
+        low, high = yarn_find_correction_range(
+            self.beta_fast,
+            self.beta_slow,
+            dim,
+            self.base,
+            self.original_max_position_embeddings,
+        )
+        inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2).to(
+            device=device, dtype=torch.float32
+        )
+        inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+
+        freqs = torch.outer(t, inv_freq)
+
+        _mscale = float(
+            yarn_get_mscale(self.scaling_factor, self.mscale)
+            / yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
+        )
+
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer(
+            "cos_cached",
+            (emb.cos() * _mscale)[None, None, :, :].to(dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "sin_cached",
+            (emb.sin() * _mscale)[None, None, :, :].to(dtype),
+            persistent=False,
+        )
+
+
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -248,11 +478,14 @@ class LlamaAttention(nn.Module):
     def _init_rope(self):
         if self.config.rope_scaling is None:
             self.rotary_emb = LlamaRotaryEmbedding(
-                self.head_dim, max_position_embeddings=self.max_position_embeddings
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=getattr(self.config, "rope_theta", 10000),
             )
         else:
             scaling_type = self.config.rope_scaling["rope_type"]
-            scaling_factor = self.config.rope_scaling["factor"]
+            if hasattr(self.config.rope_scaling, "factor"):
+                scaling_factor = self.config.rope_scaling["factor"]
             if scaling_type == "linear":
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     self.head_dim,
@@ -270,6 +503,23 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaRotaryEmbedding(
                     self.head_dim, max_position_embeddings=self.max_position_embeddings
                 )
+            elif scaling_type == "mrope":
+                self.rotary_emb = LlamaMutiRotaryEmbedding(
+                    self.head_dim, max_position_embeddings=self.max_position_embeddings
+                )
+            elif scaling_type == "yarn":
+                self.rotary_emb = LlamaYarnRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    original_max_position_embeddings=self.config.rope_scaling[
+                        "original_max_position_embeddings"
+                    ],
+                    scaling_factor=self.config.rope_scaling["factor"],
+                    beta_fast=self.config.rope_scaling["beta_fast"],
+                    beta_slow=self.config.rope_scaling["beta_slow"],
+                    mscale=self.config.rope_scaling["mscale"],
+                    mscale_all_dim=self.config.rope_scaling["mscale_all_dim"],
+                )
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 
@@ -286,7 +536,7 @@ class LlamaAttention(nn.Module):
         cache_hidden: Optional[List[torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -307,11 +557,22 @@ class LlamaAttention(nn.Module):
         ).transpose(1, 2)
 
         if cache_hidden is None:
-            cos, sin = self.rotary_emb(query_states, seq_len=q_len)
-            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-            query_states, key_states = apply_rotary_pos_emb(
-                query_states, key_states, cos, sin, position_ids
-            )
+            if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+                cos, sin = self.rotary_emb(query_states, position_ids)
+                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                query_states, key_states = apply_multimodal_rotary_pos_emb(
+                    query_states,
+                    key_states,
+                    cos,
+                    sin,
+                    self.config.rope_scaling["mrope_section"],
+                )
+            else:
+                cos, sin = self.rotary_emb(query_states, seq_len=q_len)
+                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                query_states, key_states = apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin, position_ids
+                )
 
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -327,12 +588,22 @@ class LlamaAttention(nn.Module):
 
         else:
             lck = len(cache_hidden[0])
-
-            cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
-            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-            query_states, key_states = apply_rotary_pos_emb(
-                query_states, key_states, cos, sin, position_ids + lck
-            )
+            if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+                cos, sin = self.rotary_emb(query_states, position_ids + lck)
+                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                query_states, key_states = apply_multimodal_rotary_pos_emb(
+                    query_states,
+                    key_states,
+                    cos,
+                    sin,
+                    self.config.rope_scaling["mrope_section"],
+                )
+            else:
+                cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                query_states, key_states = apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin, position_ids
+                )
 
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -386,18 +657,125 @@ class LlamaAttention(nn.Module):
         return attn_output
 
 
+class LlamaFlexAttention(LlamaAttention):
+    """
+    Attention layer implemented with flex attention. We keep the parameters consistent with LlamaAttention.
+    The used parameters are:
+        - hidden_states: input hidden states
+        - attention_mask: attention mask not expanded, straight from data loader.
+        - position_ids: position ids
+        - past_key_values: dynamic cache used for storing past key and value states.
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_hidden: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        past_seen_tokens = (
+            past_key_values.get_seq_length() if past_key_values is not None else 0
+        )
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+
+        lck = past_seen_tokens // q_len
+        if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
+            cos, sin = self.rotary_emb(query_states, position_ids + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states, key_states = apply_multimodal_rotary_pos_emb(
+                query_states,
+                key_states,
+                cos,
+                sin,
+                self.config.rope_scaling["mrope_section"],
+            )
+        else:
+            cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            # Keep positions ids aligned when padding so the KV cache is unaffected.
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids + lck
+            )
+
+        cache_position: torch.Tensor = torch.arange(
+            past_seen_tokens, past_seen_tokens + q_len, device=hidden_states.device
+        )
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+
+        key_cache, value_cache = past_key_values.update(
+            key_states,
+            value_states,
+            layer_idx=0,  # TODO: support multiple layers
+            cache_kwargs=cache_kwargs,
+        )
+
+        seq_lengths = attention_mask.sum(dim=-1)
+        # Shrink the attention mask to align with the padding to the right.
+        # This is equivalent to the shrinking logic in eagle3.py
+        seq_lengths -= lck
+        # TODO: Remove the usage of uncompiled create_block_mask after
+        # https://github.com/pytorch/pytorch/issues/160018
+        if q_len <= 128:
+            create_block_mask_func = create_block_mask
+            flex_attention_func = flex_attention
+        else:
+            create_block_mask_func = compile_friendly_create_block_mask
+            flex_attention_func = compile_friendly_flex_attention
+
+        block_mask = create_block_mask_func(
+            mask_mod=generate_eagle3_mask(
+                seq_lengths=seq_lengths,
+                Q_LEN=q_len,
+                KV_LEN=key_cache.shape[-2],
+                lck=lck,
+            ),
+            B=bsz,
+            H=1,  # Rely on broadcast
+            Q_LEN=q_len,
+            KV_LEN=key_cache.shape[-2],
+            device=query_states.device,
+        )
+        attn_output = flex_attention_func(
+            query=query_states,
+            key=key_cache.contiguous(),
+            value=value_cache.contiguous(),
+            block_mask=block_mask,
+            enable_gqa=True,
+        )
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
+        attn_output = self.o_proj(attn_output)
+        return attn_output
+
+
 class LlamaMLP(nn.Module):
-    def __init__(self, config, last=True):
+    def __init__(self, config):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        # if last:
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        # else:
-        #     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size * 2, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
@@ -443,6 +821,7 @@ class LlamaRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+    @torch.compile(dynamic=True)
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
@@ -452,11 +831,19 @@ class LlamaRMSNorm(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config, last=True):
+    def __init__(self, config, attention_backend: str = "sdpa"):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = LlamaAttention(config=config)
-        self.mlp = LlamaMLP(config, last=last)
+
+        if attention_backend == "sdpa":
+            self.self_attn = LlamaAttention(config=config)
+        elif attention_backend == "flex_attention":
+            print_with_rank("Using flex attention on draft model training!")
+            self.self_attn = LlamaFlexAttention(config=config)
+        else:
+            raise ValueError(f"Unknown attention backend {attention_backend}")
+
+        self.mlp = LlamaMLP(config)
         # self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -470,10 +857,10 @@ class LlamaDecoderLayer(nn.Module):
         self,
         input_emb: torch.Tensor,
         hidden_states: torch.Tensor,
-        cache_hidden: List[List[torch.Tensor]] = [],
+        cache_hidden: List[List[torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
     ) -> Tuple[
@@ -490,7 +877,7 @@ class LlamaDecoderLayer(nn.Module):
             use_cache (`bool`, *optional*):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
-            past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
+            past_key_values (`Cache`, *optional*): cached past key and value projection states
         """
 
         residual = hidden_states
@@ -505,7 +892,7 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=past_key_value,
+            past_key_values=past_key_values,
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
@@ -525,7 +912,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     config_class = LlamaConfig
 
-    def __init__(self, config, quant_config=None) -> None:
+    def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
         super().__init__(config)
         self.config = config
         self.quant_config = quant_config
@@ -535,7 +922,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
-        self.midlayer = LlamaDecoderLayer(config)
+        self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
 
         if hasattr(config, "target_hidden_size"):
             self.fc = torch.nn.Linear(
@@ -557,33 +944,6 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
 
-    def _prepare_decoder_attention_mask(
-        self, attention_mask, input_shape, inputs_embeds, past_key_values_length
-    ):
-        # create causal mask
-        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-        combined_attention_mask = None
-        if input_shape[-1] > 1:
-            combined_attention_mask = _make_causal_mask(
-                input_shape,
-                inputs_embeds.dtype,
-                device=inputs_embeds.device,
-                past_key_values_length=past_key_values_length,
-            )
-
-        if attention_mask is not None:
-            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            expanded_attn_mask = _expand_mask(
-                attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
-            ).to(inputs_embeds.device)
-            combined_attention_mask = (
-                expanded_attn_mask
-                if combined_attention_mask is None
-                else expanded_attn_mask + combined_attention_mask
-            )
-
-        return combined_attention_mask
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -600,10 +960,10 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             position_ids (`torch.LongTensor`, *optional*): position ids of shape `(batch, seq_len)`
         """
         if ttt_length == 1:
-            logger.info("using ttt_length 1, no need to cache hidden states")
+            print_with_rank("using ttt_length 1, no need to cache hidden states")
             cache_hidden = None
         else:
-            logger.info(f"using ttt_length {ttt_length}, caching hidden states")
+            print_with_rank(f"using ttt_length {ttt_length}, caching hidden states")
             cache_hidden = [[], []]
 
         batch_size, seq_length, _ = hidden_states.size()
@@ -618,7 +978,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             attention_mask = torch.ones(
                 (batch_size, seq_length), dtype=torch.bool, device=hidden_states.device
             )
-        attention_mask = self._prepare_decoder_attention_mask(
+        attention_mask = prepare_decoder_attention_mask(
             attention_mask, (batch_size, seq_length), hidden_states, 0
         )
 
@@ -630,7 +990,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             cache_hidden=cache_hidden,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=None,
+            past_key_values=None,
             output_attentions=False,
             use_cache=False,
         )
@@ -659,6 +1019,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         cache_hidden: torch.Tensor,
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
+        past_key_values: Optional[Cache] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
         return self.midlayer(
@@ -667,7 +1028,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             cache_hidden=cache_hidden,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=None,
+            past_key_values=past_key_values,
             output_attentions=False,
             use_cache=False,
         )

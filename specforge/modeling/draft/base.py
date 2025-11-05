@@ -24,13 +24,14 @@ import glob
 import json
 import os
 from abc import ABC, abstractmethod
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
-from transformers import PreTrainedModel
+from transformers.cache_utils import Cache
+from transformers.modeling_utils import PreTrainedModel
 
 from specforge.modeling._mask_utils import _expand_mask, _make_causal_mask
 
@@ -104,6 +105,7 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         cache_hidden: torch.Tensor,
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
+        past_key_values: Optional[Cache] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
         """
@@ -125,7 +127,8 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         Load the embedding of the draft model.
 
         Args:
-            model_path (str): The path to the huggingface repository.
+            model_path (str): Path to the target model. Can be either a Hugging Face
+            repository ID or a local directory path containing the model files.
         """
         if os.path.exists(model_path):
             # model_path is a local directory
@@ -134,7 +137,22 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
             index_json_path = glob.glob(glob_path)
 
             if len(index_json_path) == 0:
-                raise FileNotFoundError(f"No index.json file found in {model_path}")
+                # No index.json found, look for single model file
+                safetensors_path = os.path.join(model_path, "model.safetensors")
+                if os.path.exists(safetensors_path):
+                    with safe_open(safetensors_path, framework="pt") as f:
+                        self.embed_tokens.weight.copy_(f.get_tensor(embedding_key))
+                    return
+
+                pytorch_model_path = os.path.join(model_path, "pytorch_model.bin")
+                if os.path.exists(pytorch_model_path):
+                    state_dict = torch.load(pytorch_model_path, map_location="cpu")
+                    self.embed_tokens.weight.copy_(state_dict[embedding_key])
+                    return
+
+                raise FileNotFoundError(
+                    f"No index.json, model.safetensors or pytorch_model.bin found in {model_path}"
+                )
             if len(index_json_path) > 1:
                 raise FileNotFoundError(
                     f"Multiple index.json files found in {model_path}"
@@ -173,3 +191,4 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         vocab_mapping = torch.load(file_path)
         self.t2d.copy_(vocab_mapping["t2d"])
         self.d2t.copy_(vocab_mapping["d2t"])
+        self.vocab_mapping_loaded = True

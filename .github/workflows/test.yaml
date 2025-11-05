@@ -1,0 +1,34 @@
+name: PR Test
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: pr-test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit-test:
+    if: (github.repository == 'sgl-project/SpecForge' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
+    runs-on: [self-hosted]
+    container:
+      image: lmsysorg/sglang:dev
+      options: --gpus all --shm-size=2g --rm -v /dev/shm
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          pip install -e .
+
+      - name: Run test
+        timeout-minutes: 10
+        run: |
+          python tests/ci/gpu_lock_exec.py --devices 6,7 python -m unittest discover -s ./tests -p "test_*.py"
