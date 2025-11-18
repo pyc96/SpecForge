@@ -335,7 +335,8 @@ def build_eagle3_dataset(
 
     dataset = dataset.shuffle(seed=shuffle_seed)
     original_cols = dataset.column_names
-    original_cols.remove("id")
+    if "id" in original_cols:
+        original_cols.remove("id")
 
     def preprocess_function(examples):
         # Handle different dataset formats
@@ -366,8 +367,8 @@ def build_eagle3_dataset(
                     f"Expected 'conversations' column for is_preformatted=False, but found columns: {list(examples.keys())}"
                 )
             conversations = examples.pop("conversations")
-            if "id" in examples:
-                examples.pop("id")
+            # if "id" in examples:
+            #     examples.pop("id")
             processed = preprocess_conversations(
                 tokenizer,
                 conversations,
