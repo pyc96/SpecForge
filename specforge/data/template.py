@@ -191,7 +191,7 @@ TEMPLATE_REGISTRY.register(
 TEMPLATE_REGISTRY.register(
     name="minimax",
     template=ChatTemplate(
-        assistant_header="]~b]ai\n",
+        assistant_header="]~b]ai\n<think>\n", # Note this must match how data is generated. If ai response already has <think>, it needs to be removed here.
         user_header="]~b]user\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="[e~[\n",
