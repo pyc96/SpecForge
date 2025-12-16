@@ -197,3 +197,15 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="[e~[\n",
     )
 )
+
+
+TEMPLATE_REGISTRY.register(
+    name="kimi-k2-thinking",
+    template=ChatTemplate(
+        assistant_header="<|im_assistant|>assistant<|im_middle|><think>", # Note this must match how data is generated. If ai response already has <think>, it needs to be removed here.
+        user_header="<|im_user|>user<|im_middle|>",
+        system_prompt="You are Kimi, an AI assistant created by Moonshot AI.",
+        end_of_turn_token="<|im_end|>",
+    )
+)
+

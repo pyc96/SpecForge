@@ -25,6 +25,7 @@ import re
 import warnings
 from collections import Counter
 from typing import Dict, List, Optional, Tuple, Union
+import functools
 
 import torch
 from datasets import Dataset as HFDataset
@@ -116,6 +117,7 @@ def preprocess_conversations(
     chat_template: ChatTemplate,
     max_length: int = 2048,
     is_preformatted: bool = False,
+    native_parsing=False,
     **kwargs,
 ) -> Dict[str, List[torch.Tensor]]:
     """
@@ -137,10 +139,10 @@ def preprocess_conversations(
     """
 
     # prepare result
-    results = {"input_ids": [], "loss_mask": [], "attention_mask": []}
+    results = {"input_ids": [], "loss_mask": [], "attention_mask": [], "raw": []}
 
     if chat_template.parser_type == "general":
-        parser = GeneralParser(tokenizer, chat_template)
+        parser = GeneralParser(tokenizer, chat_template, native_parsing)
     elif chat_template.parser_type == "openai-harmony":
         parser = HarmonyParser(tokenizer, chat_template)
     else:
@@ -154,12 +156,13 @@ def preprocess_conversations(
         if not source:
             # if the source is None, skip it
             continue
-        input_ids, loss_mask = parser.parse(
+        input_ids, loss_mask, raw = parser.parse(
             source, max_length, preformatted=is_preformatted, **kwargs_item
         )
         results["input_ids"].append(input_ids[None, :])
         results["loss_mask"].append(loss_mask[None, :])
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
+        results["raw"].append(raw)
     return results
 
 
@@ -291,6 +294,7 @@ def build_eagle3_dataset(
     is_vlm: Optional[bool] = False,
     processor: Optional[ImageProcessingMixin] = None,
     is_preformatted: Optional[bool] = False,
+    native_parsing: Optional[bool] = False,
 ) -> HFDataset:
     """
     build eagle3 dataset
@@ -338,6 +342,8 @@ def build_eagle3_dataset(
     if "id" in original_cols:
         original_cols.remove("id")
 
+    native_preprocess = functools.partial(preprocess_conversations, native_parsing=native_parsing)
+
     def preprocess_function(examples):
         # Handle different dataset formats
         if is_vlm:
@@ -369,7 +375,7 @@ def build_eagle3_dataset(
             conversations = examples.pop("conversations")
             # if "id" in examples:
             #     examples.pop("id")
-            processed = preprocess_conversations(
+            processed = native_preprocess(
                 tokenizer,
                 conversations,
                 template,
@@ -377,7 +383,6 @@ def build_eagle3_dataset(
                 is_preformatted=False,
                 **examples,
             )
-
         return processed
 
     # Process dataset only once

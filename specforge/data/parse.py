@@ -38,7 +38,7 @@ _harmony_encoding = None
 
 class GeneralParser(Parser):
 
-    def __init__(self, tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate):
+    def __init__(self, tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate, native_parsing: bool):
         super().__init__(tokenizer, chat_template)
         self.system_prompt = chat_template.system_prompt
         self.user_message_separator = (
@@ -47,6 +47,52 @@ class GeneralParser(Parser):
         self.assistant_message_separator = (
             f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
         )
+        self.native_parsing = native_parsing
+        self.value_map = {"assistant": 1}
+
+    def native_parse(self, messages, max_len):
+        tokenizer = self.tokenizer
+        conversation = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+
+        if messages[0]["role"] == "system":
+            si = messages[0]["content"]
+            si_count = len(tokenizer(si, add_special_tokens=False).input_ids)
+            si_header_count = 3  #  <|im_system|>system<|im_middle|>
+            l = si_count + si_header_count
+            msg_idx = [("system", si_header_count, l + 1)]
+        else:
+            msg_idx = []
+            l = 0
+
+        for msg in messages:
+            if msg["role"] == "system":
+                continue
+            l += 4  # <|im_end|><|im_user|>user<|im_middle|>
+            start = l
+            l += len(tokenizer(msg["content"], add_special_tokens=False).input_ids)
+            if msg["role"] == "assistant":
+                l += 1 # for <think>
+            msg_idx.append((msg["role"], start + 1 if msg["role"] == "assistant" else start, l + 2)) # to also include eos
+            if l > max_len:
+                break
+
+        input_ids = tokenizer(
+            conversation,
+            return_tensors="pt",
+            add_special_tokens=False,
+        ).input_ids[0]
+        loss_mask = torch.zeros_like(input_ids)
+
+        for i in range(len(msg_idx)):
+            role, start, end = msg_idx[i]
+            if role not in self.value_map:
+                continue
+            loss_mask[start:end] = self.value_map[role]
+        return input_ids[None, :max_len], loss_mask[None, :max_len], conversation
 
     def parse(
         self,
@@ -55,6 +101,9 @@ class GeneralParser(Parser):
         preformatted: bool = False,
         **kwargs,
     ) -> Dict[str, List[torch.Tensor]]:
+        if self.native_parsing:
+            return self.native_parse(conversation, max_length)
+
         if not preformatted:
             messages = []
 
@@ -119,7 +168,7 @@ class GeneralParser(Parser):
                 if token_start > assistant_end_char:
                     continue  # token after assistant text
                 loss_mask[idx] = 1
-        return input_ids, loss_mask
+        return input_ids, loss_mask, conversation
 
 
 class HarmonyParser(Parser):
